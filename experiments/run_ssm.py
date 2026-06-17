@@ -24,9 +24,9 @@ Models (all sized to the same per-block parameter budget):
 Examples:
     uv run --no-sync python -u experiments/run_ssm.py --preset smoke
     uv run --no-sync python -u experiments/run_ssm.py --preset longrange --device cuda
-    # push the frontier (e.g. on a desktop GPU):
-    uv run --no-sync python -u experiments/run_ssm.py --preset longrange \
-        --d-list 5 --n-layers 3 --device cuda --out results_d5.csv
+    # RTX 3080 version: bigger batch/samples/seeds, deeper, pushes d=5 by default:
+    uv run --no-sync python -u experiments/run_ssm.py --preset gpu3080 \
+        --device cuda --out results_3080.csv
 """
 
 from __future__ import annotations
@@ -185,6 +185,16 @@ PRESETS = {
         decision_window=12, n_branches=4, d_state=8, conv_k=4, jitter=1.5,
         spike_width=0.75, background_rate=0.002, seeds=3, n_random_rules=0,
         active_lo=0.0, active_hi=0.35),
+    # RTX 3080 (10GB Ampere) version of the long-range regime. VRAM is basically
+    # free at this scale, so we spend it on a bigger batch, more samples, deeper
+    # stacks, longer sequences, and more seeds (tighter error bars) -- and push
+    # d=5 by default. TF32 + cuDNN autotune are enabled automatically on CUDA.
+    "gpu3080": dict(
+        d_list=[4, 5], target_params=80000, d_model=128, n_layers=3, epochs=400,
+        lr=2e-3, batch_size=512, samples=96, n_time=80, axons_per_bit=8,
+        decision_window=14, n_branches=4, d_state=16, conv_k=4, jitter=1.5,
+        spike_width=0.75, background_rate=0.002, seeds=5, n_random_rules=0,
+        active_lo=0.0, active_hi=0.35),
 }
 
 
@@ -231,6 +241,12 @@ def configure(args):
     if unknown:
         raise ValueError(f"Unknown models: {unknown}")
     args.device = pick_device(args.device)
+    if args.device == "cuda":
+        # Ampere (e.g. RTX 3080) freebies: TF32 matmuls and cuDNN autotuning for
+        # the fixed conv shapes. Pure speed, no behaviour change worth caring about.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     return BlockCfg(d_model=args.d_model, d_state=args.d_state,
                     conv_k=args.conv_k, n_branches=args.n_branches)
 

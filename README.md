@@ -1,0 +1,3 @@
+Research repo where I'm playing around with trying to implement What can a neuron compute (https://www.biorxiv.org/content/10.64898/2026.06.08.730984v1) with transformers and just seeing what comes out of it. Trying stuff like nonlinear branches, regenerative plateau spikes, coincidence detection to try to make transformers or MLPs more brain/neuron like.
+
+Right now I'm doing 2 Mamba-ish memory streams multiplied together and run through a plateau nonlinearity. Solves long range parity up to d=4 which convolution can't so it's kind of working. Most of this was run on my 4070 mobile laptop gpu so it's very small scale and proof-of-concept like instead of actually implementable stuff. 

@@ -1,0 +1,38 @@
+[project]
+name = "dendritic-transformer"
+version = "0.1.0"
+description = "POC: dendritic FFN block vs point-neuron baselines (MLP/SwiGLU), inspired by Aizenbud et al. 2026, 'What can a neuron compute?'"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "tiktoken>=0.5",
+    "datasets>=2.14",
+]
+
+# Run with uv (creates/uses .venv automatically):
+#   uv sync
+#   uv run experiments/run_boolean.py                 # CPU-friendly boolean suite
+#   uv run experiments/run_lm.py --preset cpu         # quick LM sanity check
+#   uv run experiments/run_lm.py --preset gpu         # bigger run for the 4070 (8GB)
+#
+# Default install pulls CPU wheels. The code auto-detects CUDA at runtime
+# (device "auto"), so once a CUDA torch is installed it uses the GPU unchanged.
+# For CUDA wheels (when the GPU is free), e.g. CUDA 12.4:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+[tool.uv]
+# Treat as a virtual (non-packaged) project: uv only manages the venv + deps,
+# no build of a local wheel. Experiments add ./src to sys.path themselves.
+package = false
+
+# Pull torch from the CUDA 12.4 wheel index so `uv sync`/`uv run` install the
+# GPU build (and don't revert to CPU). Switch the URL to whl/cpu for a
+# CPU-only machine, or another cuXXX tag to match a different driver.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }

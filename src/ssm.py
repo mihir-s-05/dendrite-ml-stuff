@@ -147,9 +147,10 @@ class MambaBlock(GatedSSMBlock):
     """Simplified Mamba block: a single gated selective SSM with a causal conv."""
 
     def __init__(self, d_model: int, d_inner: int | None = None, d_state: int = 8,
-                 dt_rank: int | None = None, conv_k: int = 4, expand: int = 2):
+                 dt_rank: int | None = None, conv_k: int = 4, expand: int = 2,
+                 chunk: int = 8):
         super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
-        self.ssm = SelectiveSSM(self.d_inner, d_state, dt_rank)
+        self.ssm = SelectiveSSM(self.d_inner, d_state, dt_rank, chunk=chunk)
 
     def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
         return self.ssm(streams[0])
@@ -189,11 +190,11 @@ class CoincidenceSSM(GatedSSMBlock):
 
     def __init__(self, d_model: int, d_inner: int | None = None, d_state: int = 8,
                  dt_rank: int | None = None, conv_k: int = 4, expand: int = 2,
-                 use_plateau: bool = True, combine: str = "mult"):
+                 use_plateau: bool = True, combine: str = "mult", chunk: int = 8):
         super().__init__(d_model, d_inner or expand * d_model, n_streams=2, conv_k=conv_k)
         self.combine = combine
-        self.ssm_a = SelectiveSSM(self.d_inner, d_state, dt_rank)
-        self.ssm_b = SelectiveSSM(self.d_inner, d_state, dt_rank)
+        self.ssm_a = SelectiveSSM(self.d_inner, d_state, dt_rank, chunk=chunk)
+        self.ssm_b = SelectiveSSM(self.d_inner, d_state, dt_rank, chunk=chunk)
         self.plateau = Plateau(self.d_inner) if use_plateau else None
 
     def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
@@ -221,14 +222,14 @@ class DendriticSSMBlock(GatedSSMBlock):
     def __init__(self, d_model: int, d_inner: int | None = None, n_branches: int = 8,
                  d_state: int = 8, dt_rank: int | None = None, conv_k: int = 4,
                  expand: int = 2, use_tree: bool = True, use_plateau: bool = True,
-                 soma_mode: str = "mult"):
+                 soma_mode: str = "mult", chunk: int = 8):
         G = n_branches if use_tree else 1
         db = max(1, math.ceil((d_inner or expand * d_model) / G))   # per-branch width
         super().__init__(d_model, db * G, n_streams=1, conv_k=conv_k)
         self.G, self.db, self.soma_mode = G, db, soma_mode
         # Shared SSM params across branches; branches differ by state + input
         # slice (folding G into the batch gives independent integration).
-        self.branch_ssm = SelectiveSSM(db, d_state, dt_rank)
+        self.branch_ssm = SelectiveSSM(db, d_state, dt_rank, chunk=chunk)
         self.plateau = Plateau(db) if use_plateau else None
         self.soma = nn.Linear(self.d_inner, self.d_inner, bias=True)
         if soma_mode == "mult":

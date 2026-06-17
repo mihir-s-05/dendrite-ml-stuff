@@ -63,6 +63,9 @@ class BlockCfg:
     d_state: int
     conv_k: int
     n_branches: int
+    # Scan chunk for the SSM cores: bigger = fewer Python-loop iterations / kernel
+    # launches (faster on GPU) at the cost of more peak memory. Math is identical.
+    chunk: int = 8
 
 
 @dataclass(frozen=True)
@@ -86,20 +89,20 @@ REGISTRY: dict[str, ModelSpec] = {
         lambda w, c: GatedConvFFN(c.d_model, w, memory_kernel=CONV_MEM), "hidden"),
     "mamba": ModelSpec(
         lambda w, c: MambaBlock(c.d_model, d_inner=_ssm_width(w), d_state=c.d_state,
-                                conv_k=c.conv_k), "d_inner"),
+                                conv_k=c.conv_k, chunk=c.chunk), "d_inner"),
     "ssm_coinc": ModelSpec(
         lambda w, c: CoincidenceSSM(c.d_model, d_inner=_ssm_width(w), d_state=c.d_state,
-                                    conv_k=c.conv_k), "d_inner"),
+                                    conv_k=c.conv_k, chunk=c.chunk), "d_inner"),
     "ssm_sum": ModelSpec(
         lambda w, c: CoincidenceSSM(c.d_model, d_inner=_ssm_width(w), d_state=c.d_state,
-                                    conv_k=c.conv_k, combine="sum"), "d_inner"),
+                                    conv_k=c.conv_k, combine="sum", chunk=c.chunk), "d_inner"),
     "ssm_coinc_noplat": ModelSpec(
         lambda w, c: CoincidenceSSM(c.d_model, d_inner=_ssm_width(w), d_state=c.d_state,
-                                    conv_k=c.conv_k, use_plateau=False), "d_inner"),
+                                    conv_k=c.conv_k, use_plateau=False, chunk=c.chunk), "d_inner"),
     "dendritic_ssm": ModelSpec(
         lambda w, c: DendriticSSMBlock(c.d_model, d_inner=_ssm_width(w),
                                        n_branches=c.n_branches, d_state=c.d_state,
-                                       conv_k=c.conv_k), "d_inner"),
+                                       conv_k=c.conv_k, chunk=c.chunk), "d_inner"),
 }
 MODELS = list(REGISTRY)
 
@@ -164,19 +167,19 @@ PRESETS = {
         lr=3e-3, batch_size=128, samples=12, n_time=24, axons_per_bit=4,
         decision_window=8, n_branches=4, d_state=8, conv_k=4, jitter=1.25,
         spike_width=0.5, background_rate=0.001, seeds=1, n_random_rules=2,
-        active_lo=None, active_hi=None),
+        active_lo=None, active_hi=None, chunk=8),
     "cpu": dict(
         d_list=[2, 4, 6], target_params=30000, d_model=96, n_layers=1, epochs=80,
         lr=3e-3, batch_size=256, samples=24, n_time=40, axons_per_bit=6,
         decision_window=10, n_branches=8, d_state=8, conv_k=4, jitter=1.5,
         spike_width=0.75, background_rate=0.002, seeds=2, n_random_rules=4,
-        active_lo=None, active_hi=None),
+        active_lo=None, active_hi=None, chunk=8),
     "gpu": dict(
         d_list=[4, 6, 8, 10], target_params=80000, d_model=128, n_layers=1,
         epochs=200, lr=2e-3, batch_size=256, samples=48, n_time=64,
         axons_per_bit=8, decision_window=12, n_branches=8, d_state=16, conv_k=4,
         jitter=1.5, spike_width=0.75, background_rate=0.002, seeds=3,
-        n_random_rules=8, active_lo=None, active_hi=None),
+        n_random_rules=8, active_lo=None, active_hi=None, chunk=16),
     # The headline regime: spikes early, readout at the end (long gap). Override
     # --d-list / --n-layers / --seeds to push the frontier (e.g. d=5, 3 layers).
     "longrange": dict(
@@ -184,17 +187,20 @@ PRESETS = {
         lr=2e-3, batch_size=256, samples=48, n_time=64, axons_per_bit=8,
         decision_window=12, n_branches=4, d_state=8, conv_k=4, jitter=1.5,
         spike_width=0.75, background_rate=0.002, seeds=3, n_random_rules=0,
-        active_lo=0.0, active_hi=0.35),
-    # RTX 3080 (10GB Ampere) version of the long-range regime. VRAM is basically
-    # free at this scale, so we spend it on a bigger batch, more samples, deeper
-    # stacks, longer sequences, and more seeds (tighter error bars) -- and push
-    # d=5 by default. TF32 + cuDNN autotune are enabled automatically on CUDA.
+        active_lo=0.0, active_hi=0.35, chunk=16),
+    # RTX 3080 (10GB Ampere) long-range version. The SSM scan is a Python loop,
+    # so it is launch-bound, not FLOP-bound: a big batch does NOT make the SSM
+    # models proportionally faster, it just makes each cell take minutes. So we
+    # keep the batch modest, raise `chunk` (fewer loop iterations = the real GPU
+    # speedup), and trim epochs/seeds so the whole d=4+d=5 sweep finishes in a
+    # few hours. TF32 + cuDNN autotune turn on automatically on CUDA. Scale up
+    # with --epochs / --seeds / --samples once you've seen the per-cell timing.
     "gpu3080": dict(
-        d_list=[4, 5], target_params=80000, d_model=128, n_layers=3, epochs=400,
-        lr=2e-3, batch_size=512, samples=96, n_time=80, axons_per_bit=8,
-        decision_window=14, n_branches=4, d_state=16, conv_k=4, jitter=1.5,
-        spike_width=0.75, background_rate=0.002, seeds=5, n_random_rules=0,
-        active_lo=0.0, active_hi=0.35),
+        d_list=[4, 5], target_params=60000, d_model=128, n_layers=3, epochs=200,
+        lr=2e-3, batch_size=256, samples=64, n_time=64, axons_per_bit=8,
+        decision_window=12, n_branches=4, d_state=16, conv_k=4, jitter=1.5,
+        spike_width=0.75, background_rate=0.002, seeds=2, n_random_rules=0,
+        active_lo=0.0, active_hi=0.35, chunk=32),
 }
 
 
@@ -218,7 +224,8 @@ def parse_args():
                       ("n-branches", int), ("d-state", int), ("conv-k", int),
                       ("jitter", float), ("spike-width", float),
                       ("background-rate", float), ("seeds", int),
-                      ("n-random-rules", int), ("active-lo", float), ("active-hi", float)]:
+                      ("n-random-rules", int), ("active-lo", float),
+                      ("active-hi", float), ("chunk", int)]:
         ap.add_argument(f"--{name}", type=typ, nargs="+" if name == "d-list" else None,
                         default=None)
     return ap.parse_args()
@@ -248,7 +255,8 @@ def configure(args):
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
     return BlockCfg(d_model=args.d_model, d_state=args.d_state,
-                    conv_k=args.conv_k, n_branches=args.n_branches)
+                    conv_k=args.conv_k, n_branches=args.n_branches,
+                    chunk=args.chunk)
 
 
 def print_header(args, bcfg):
@@ -258,7 +266,7 @@ def print_header(args, bcfg):
                 f"gap before readout (decision_window={args.decision_window})")
     print(f"\nDevice: {args.device} (preset={args.preset}). T={args.n_time}, "
           f"axons/bit={args.axons_per_bit}, jitter={args.jitter}, "
-          f"branches={args.n_branches}, d_state={args.d_state}, "
+          f"branches={args.n_branches}, d_state={args.d_state}, scan_chunk={args.chunk}, "
           f"budget~{args.target_params} params/block.\nSpike timing: {span}.\n")
     print("Block sizes:")
     for m in args.models:

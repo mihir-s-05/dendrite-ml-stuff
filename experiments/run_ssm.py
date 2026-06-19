@@ -216,6 +216,9 @@ def parse_args():
     ap.add_argument("--threads", type=int, default=0,
                     help="cap torch CPU threads (0=default); lower reduces sustained "
                          "CPU power draw on thermally-limited machines")
+    ap.add_argument("--solved-thresh", type=float, default=0.9,
+                    help="accuracy above which a seed counts as having 'solved' the "
+                         "task, for the fraction-solved summary")
     # Everything below defaults to None and is filled from the chosen preset.
     for name, typ in [("d-list", int), ("target-params", int), ("d-model", int),
                       ("n-layers", int), ("epochs", int), ("lr", float),
@@ -286,6 +289,22 @@ def print_table(title, args, store, section, rows):
             vals = store.values(section, d, m, seeds)
             line += (f"{np.mean(vals)*100:11.1f}+-{np.std(vals)*100:4.1f}"
                      if vals else f"{'--':>18s}")
+        print(line, flush=True)
+
+    # In this regime accuracy is bimodal (a seed either finds the coincidence
+    # solution or sits at chance), so "how many seeds solved it" is the honest
+    # summary. A model that solves k/n seeds is doing something the chance
+    # models (0/n) provably cannot, even if its mean looks middling.
+    print(f"  -- fraction of seeds solved (acc > {args.solved_thresh:.2f}) --")
+    for d, seeds in rows:
+        line = f"  {d:<3d} "
+        for m in args.models:
+            vals = store.values(section, d, m, seeds)
+            if vals:
+                k = sum(v > args.solved_thresh for v in vals)
+                line += f"{k}/{len(vals):<16d}"
+            else:
+                line += f"{'--':>18s}"
         print(line, flush=True)
 
 

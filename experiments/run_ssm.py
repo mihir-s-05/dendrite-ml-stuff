@@ -103,6 +103,25 @@ REGISTRY: dict[str, ModelSpec] = {
         lambda w, c: DendriticSSMBlock(c.d_model, d_inner=_ssm_width(w),
                                        n_branches=c.n_branches, d_state=c.d_state,
                                        conv_k=c.conv_k, chunk=c.chunk), "d_inner"),
+    # Ablations that dissect WHY the dendritic tree works (it beat ssm_coinc at
+    # d=4). Each drops one ingredient; if the win is "coincidence + plateau" then
+    # _add and _noplat should fall to chance like ssm_sum / ssm_coinc_noplat, and
+    # _notree should test whether the multi-branch topology itself matters.
+    "dendritic_add": ModelSpec(            # drop the multiplicative soma binding
+        lambda w, c: DendriticSSMBlock(c.d_model, d_inner=_ssm_width(w),
+                                       n_branches=c.n_branches, d_state=c.d_state,
+                                       conv_k=c.conv_k, chunk=c.chunk,
+                                       soma_mode="add"), "d_inner"),
+    "dendritic_noplat": ModelSpec(         # drop the regenerative plateau
+        lambda w, c: DendriticSSMBlock(c.d_model, d_inner=_ssm_width(w),
+                                       n_branches=c.n_branches, d_state=c.d_state,
+                                       conv_k=c.conv_k, chunk=c.chunk,
+                                       use_plateau=False), "d_inner"),
+    "dendritic_notree": ModelSpec(         # collapse the tree to a single branch
+        lambda w, c: DendriticSSMBlock(c.d_model, d_inner=_ssm_width(w),
+                                       n_branches=c.n_branches, d_state=c.d_state,
+                                       conv_k=c.conv_k, chunk=c.chunk,
+                                       use_tree=False), "d_inner"),
 }
 MODELS = list(REGISTRY)
 

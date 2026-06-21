@@ -122,6 +122,21 @@ REGISTRY: dict[str, ModelSpec] = {
                                        n_branches=c.n_branches, d_state=c.d_state,
                                        conv_k=c.conv_k, chunk=c.chunk,
                                        use_tree=False), "d_inner"),
+    # Fixed branch-count variants for the tree dose-response (does reliability
+    # rise with branch count?). n=1 is dendritic_notree, n=4 is dendritic_ssm at
+    # the default branch budget; these fill in 2/8/16 at the same param budget.
+    "dendritic_b2": ModelSpec(
+        lambda w, c: DendriticSSMBlock(c.d_model, d_inner=_ssm_width(w),
+                                       n_branches=2, d_state=c.d_state,
+                                       conv_k=c.conv_k, chunk=c.chunk), "d_inner"),
+    "dendritic_b8": ModelSpec(
+        lambda w, c: DendriticSSMBlock(c.d_model, d_inner=_ssm_width(w),
+                                       n_branches=8, d_state=c.d_state,
+                                       conv_k=c.conv_k, chunk=c.chunk), "d_inner"),
+    "dendritic_b16": ModelSpec(
+        lambda w, c: DendriticSSMBlock(c.d_model, d_inner=_ssm_width(w),
+                                       n_branches=16, d_state=c.d_state,
+                                       conv_k=c.conv_k, chunk=c.chunk), "d_inner"),
 }
 MODELS = list(REGISTRY)
 

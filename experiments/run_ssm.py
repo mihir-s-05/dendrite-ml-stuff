@@ -48,7 +48,8 @@ from src.blocks import SwiGLU, CausalConvSwiGLU, GatedConvFFN, TemporalBlockClas
 from src.counting import count_params, size_to_budget
 from src.results_store import ResultStore
 from src.ssm import MambaBlock, CoincidenceSSM, DendriticSSMBlock
-from src.tasks import parity_fn, random_balanced_boolean, make_temporal_boolean_dataset
+from src.tasks import (parity_fn, random_balanced_boolean, subset_parity_fn,
+                       make_temporal_boolean_dataset)
 from src.train import pick_device, set_seed, train_classifier
 
 # Fixed memory kernel for the conv reference baselines (the strong setting from
@@ -253,6 +254,9 @@ def parse_args():
     ap.add_argument("--solved-thresh", type=float, default=0.9,
                     help="accuracy above which a seed counts as having 'solved' the "
                          "task, for the fraction-solved summary")
+    ap.add_argument("--subset-k", type=int, default=0,
+                    help="if >0, also run SUBSET PARITY: parity over the first k of "
+                         "d bits with d-k distractors (tests selective coincidence)")
     # Everything below defaults to None and is filled from the chosen preset.
     for name, typ in [("d-list", int), ("target-params", int), ("d-model", int),
                       ("n-layers", int), ("epochs", int), ("lr", float),
@@ -372,6 +376,21 @@ def main():
             run_group(args, bcfg, store, "rand", 4, fn, seed)
         print_table("TEMPORAL RANDOM BALANCED 4-bit", args, store, "rand",
                     [(4, [seed for seed, _ in rand])])
+
+    if args.subset_k > 0:
+        sub_rows = []
+        print(f"\n=== SUBSET PARITY (k={args.subset_k} of d, rest distractors; "
+              f"running) ===", flush=True)
+        for d in args.d_list:
+            if d <= args.subset_k:
+                continue  # need at least one distractor bit
+            fn = subset_parity_fn(d, args.subset_k)
+            for s in parity_seeds:
+                run_group(args, bcfg, store, "subset", d, fn, s)
+            sub_rows.append((d, parity_seeds))
+        if sub_rows:
+            print_table(f"SUBSET PARITY (k={args.subset_k})", args, store,
+                        "subset", sub_rows)
     print()
 
 

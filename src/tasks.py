@@ -22,6 +22,22 @@ def parity_fn(d: int) -> Callable[[np.ndarray], np.ndarray]:
     return f
 
 
+def subset_parity_fn(d: int, k: int) -> Callable[[np.ndarray], np.ndarray]:
+    """Parity over the first k of d bits; the remaining d-k bits are distractors.
+
+    A clean test of *selective* coincidence: the model must bind k specific bits
+    across the long-range gap while ignoring the irrelevant ones. Still balanced
+    (parity of k bits is balanced regardless of the distractors), so chance is
+    50% and a model that integrates everything (no selectivity) cannot cheat.
+    """
+    if not 0 < k <= d:
+        raise ValueError(f"need 0 < k <= d, got k={k}, d={d}")
+
+    def f(bits: np.ndarray) -> np.ndarray:
+        return bits[..., :k].sum(axis=-1) % 2
+    return f
+
+
 def random_balanced_boolean(d: int, rng: np.random.Generator) -> Callable[[np.ndarray], np.ndarray]:
     """A uniformly random balanced Boolean function over d bits."""
     n = 2 ** d

@@ -254,9 +254,11 @@ def parse_args():
     ap.add_argument("--solved-thresh", type=float, default=0.9,
                     help="accuracy above which a seed counts as having 'solved' the "
                          "task, for the fraction-solved summary")
-    ap.add_argument("--subset-k", type=int, default=0,
-                    help="if >0, also run SUBSET PARITY: parity over the first k of "
-                         "d bits with d-k distractors (tests selective coincidence)")
+    ap.add_argument("--subset-k", type=int, nargs="+", default=None,
+                    help="if set, also run SUBSET PARITY for each k: parity over the "
+                         "first k of d bits with d-k distractors (tests selective "
+                         "coincidence). Pass several values to sweep coincidence order, "
+                         "e.g. --subset-k 2 3 4 5")
     # Everything below defaults to None and is filled from the chosen preset.
     for name, typ in [("d-list", int), ("target-params", int), ("d-model", int),
                       ("n-layers", int), ("epochs", int), ("lr", float),
@@ -377,20 +379,20 @@ def main():
         print_table("TEMPORAL RANDOM BALANCED 4-bit", args, store, "rand",
                     [(4, [seed for seed, _ in rand])])
 
-    if args.subset_k > 0:
+    for k in (args.subset_k or []):
+        section = f"subset_k{k}"
         sub_rows = []
-        print(f"\n=== SUBSET PARITY (k={args.subset_k} of d, rest distractors; "
+        print(f"\n=== SUBSET PARITY k={k} (parity of {k} bits, rest distractors; "
               f"running) ===", flush=True)
         for d in args.d_list:
-            if d <= args.subset_k:
+            if d <= k:
                 continue  # need at least one distractor bit
-            fn = subset_parity_fn(d, args.subset_k)
+            fn = subset_parity_fn(d, k)
             for s in parity_seeds:
-                run_group(args, bcfg, store, "subset", d, fn, s)
+                run_group(args, bcfg, store, section, d, fn, s)
             sub_rows.append((d, parity_seeds))
         if sub_rows:
-            print_table(f"SUBSET PARITY (k={args.subset_k})", args, store,
-                        "subset", sub_rows)
+            print_table(f"SUBSET PARITY (k={k})", args, store, section, sub_rows)
     print()
 
 

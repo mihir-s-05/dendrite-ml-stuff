@@ -52,6 +52,27 @@ def random_balanced_boolean(d: int, rng: np.random.Generator) -> Callable[[np.nd
     return f
 
 
+def make_streaming_parity(n_samples: int, seq_len: int, seed: int = 0, p: float = 0.5):
+    """Streaming parity (running XOR): an autoregressive state-tracking task.
+
+    Each sample is a random bit stream; the target at every timestep is the
+    parity of all bits seen so far. Returns numpy arrays:
+        X: (n_samples, seq_len) int64 bits in {0,1}
+        y: (n_samples, seq_len) float32 running parity in {0,1}
+
+    A purely linear recurrence (vanilla SSM/Mamba) cannot *maintain* the parity
+    bit across time -- it can track a running count, but recovering count mod 2
+    is a per-step nonlinearity whose period it must memorize, so it fails to
+    length-generalize. A model with genuine inter-step nonlinearity can hold a
+    bounded parity state and generalize to longer sequences. This is the
+    autoregressive analogue of the long-range coincidence tasks.
+    """
+    rng = np.random.default_rng(seed)
+    bits = (rng.random((n_samples, seq_len)) < p).astype(np.int64)
+    parity = (np.cumsum(bits, axis=1) % 2).astype(np.float32)
+    return bits, parity
+
+
 def make_dataset(
     d: int,
     fn: Callable[[np.ndarray], np.ndarray],

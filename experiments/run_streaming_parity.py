@@ -163,16 +163,27 @@ def batch(rng: np.random.Generator, bs: int, seq_len: int, device: str):
 
 
 @torch.no_grad()
-def evaluate(model, seq_len: int, device: str, n: int = 2048, seed: int = 999):
-    """Per-position and final-position accuracy on a fixed eval set."""
+def evaluate(model, seq_len: int, device: str, n: int = 2048, seed: int = 999,
+             token_budget: int = 16384):
+    """Per-position and final-position accuracy on a fixed eval set.
+
+    Batched with a constant token budget (rows*seq_len) so peak memory stays flat
+    across eval lengths -- the SSM scan materializes a (rows, L, d_inner, d_state)
+    tensor, which OOMs at long L if the whole eval set is run in one pass.
+    """
     model.eval()
-    bits, par = make_streaming_parity(n, seq_len, seed=seed)
-    bits = torch.from_numpy(bits).to(device)
-    par = torch.from_numpy(par).to(device)
-    pred = (model(bits) > 0).float()
-    per_pos = (pred == par).float().mean().item()
-    final = (pred[:, -1] == par[:, -1]).float().mean().item()
-    return per_pos, final
+    bits_all, par_all = make_streaming_parity(n, seq_len, seed=seed)
+    eval_bs = max(8, min(n, token_budget // seq_len))
+    pp_correct = pp_total = fin_correct = fin_total = 0
+    for i in range(0, n, eval_bs):
+        bits = torch.from_numpy(bits_all[i:i + eval_bs]).to(device)
+        par = torch.from_numpy(par_all[i:i + eval_bs]).to(device)
+        pred = (model(bits) > 0).float()
+        pp_correct += (pred == par).float().sum().item()
+        pp_total += par.numel()
+        fin_correct += (pred[:, -1] == par[:, -1]).float().sum().item()
+        fin_total += par.shape[0]
+    return pp_correct / pp_total, fin_correct / fin_total
 
 
 PRESETS = {

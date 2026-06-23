@@ -103,6 +103,74 @@ class SelectiveSSM(nn.Module):
         return y + x * self.D
 
 
+class PlateauRecurrentSSM(nn.Module):
+    """Selective SSM with the regenerative nonlinearity INSIDE the recurrence.
+
+    The linear ``SelectiveSSM`` integrates ``h_t = a_t*h_{t-1} + b_t`` and only
+    squashes the *output*. That cannot length-generalize a state machine like
+    parity: the readout learns a length-specific count->parity map. Here the
+    nonlinearity is applied to the carried state every step, and the per-step
+    multiplicative factor is a SIGNED, input-dependent gate, so the state can
+    *flip* (the multiplicative dendritic selectivity, now in the loop):
+
+        m_t = a_t * g_t,    g_t = tanh(W_g x_t) in (-1, 1)
+        h_t = tanh(m_t * h_{t-1} + b_t)
+
+    ``a_t = exp(dt*A) in (0,1]`` is the usual selective decay (bounded -> stable);
+    ``g_t`` lets the recurrence sign-invert (parity = repeated sign flip); the
+    ``tanh`` state map is the bounded regenerative plateau that keeps the state
+    from growing with length. The gate bias inits near +1 so the block behaves
+    like a plain selective SSM at init and learns to flip from there.
+
+    Sequential scan (the nonlinearity breaks associativity, so no chunked
+    parallel scan); per-step terms are built inside the loop to keep peak memory
+    at (B, d_inner, d_state) rather than (B, L, d_inner, d_state).
+    """
+
+    def __init__(self, d_inner: int, d_state: int = 8, dt_rank: int | None = None,
+                 dt_min: float = 1e-3, dt_max: float = 1e-1):
+        super().__init__()
+        self.d_inner = d_inner
+        self.d_state = d_state
+        self.dt_rank = dt_rank or max(1, d_inner // 16)
+        self.x_proj = nn.Linear(d_inner, self.dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, d_inner, bias=True)
+        self.g_proj = nn.Linear(d_inner, d_inner, bias=True)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(d_inner))
+
+        dt = torch.exp(
+            torch.rand(d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        ).clamp(min=1e-4)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+            # Bias the gate near +1 (tanh(2)~0.96) so the recurrence starts as a
+            # plain selective decay and learns to flip sign during training.
+            self.g_proj.weight.mul_(0.1)
+            self.g_proj.bias.fill_(2.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, d = x.shape
+        proj = self.x_proj(x)
+        dt, Bp, Cp = torch.split(proj, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = F.softplus(self.dt_proj(dt))                      # (B, L, d_inner)
+        g = torch.tanh(self.g_proj(x))                         # (B, L, d_inner) in (-1,1)
+        A = -torch.exp(self.A_log)                             # (d_inner, d_state)
+
+        h = x.new_zeros(B, d, self.d_state)
+        outs = []
+        for t in range(L):
+            a_t = torch.exp(dt[:, t].unsqueeze(-1) * A)        # (B, d, n) in (0,1]
+            m_t = a_t * g[:, t].unsqueeze(-1)                  # signed factor in (-1,1)
+            b_t = (dt[:, t] * x[:, t]).unsqueeze(-1) * Bp[:, t].unsqueeze(1)
+            h = torch.tanh(m_t * h + b_t)                      # nonlinearity in the loop
+            outs.append((h * Cp[:, t].unsqueeze(1)).sum(-1))   # (B, d)
+        y = torch.stack(outs, dim=1)                           # (B, L, d)
+        return y + x * self.D
+
+
 class GatedSSMBlock(nn.Module):
     """Shared Mamba-style scaffold for the SSM block family.
 
@@ -249,3 +317,22 @@ class DendriticSSMBlock(GatedSSMBlock):
             bsum = a.sum(dim=-1)                                          # (B, L, G)
             out = out + self.bind_out(bsum * self.bind_in(bsum))         # quadratic binding
         return out
+
+
+class RecurrentDendriticBlock(GatedSSMBlock):
+    """Gated block wrapping ``PlateauRecurrentSSM`` (nonlinearity in the loop).
+
+    Same Mamba-style scaffold as the other blocks so it drops into the harness;
+    the only difference from ``MambaBlock`` is the nonlinear, sign-flipping
+    recurrence at its core. ``chunk`` is accepted for call-site uniformity but
+    ignored (the scan is sequential).
+    """
+
+    def __init__(self, d_model: int, d_inner: int | None = None, d_state: int = 8,
+                 dt_rank: int | None = None, conv_k: int = 4, expand: int = 2,
+                 chunk: int = 8):
+        super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
+        self.ssm = PlateauRecurrentSSM(self.d_inner, d_state, dt_rank)
+
+    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
+        return self.ssm(streams[0])

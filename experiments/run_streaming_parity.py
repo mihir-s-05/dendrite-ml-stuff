@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir))
 
 from src.blocks import SwiGLU
 from src.counting import count_params, size_to_budget
-from src.ssm import MambaBlock, CoincidenceSSM, DendriticSSMBlock
+from src.ssm import MambaBlock, CoincidenceSSM, DendriticSSMBlock, RecurrentDendriticBlock
 from src.tasks import make_streaming_parity
 from src.train import pick_device, set_seed
 
@@ -102,6 +102,9 @@ MIXERS: dict[str, MixerSpec] = {
         lambda w, c: DendriticSSMBlock(c.d_model, d_inner=_w(w), n_branches=c.n_branches,
                                        d_state=c.d_state, conv_k=c.conv_k,
                                        chunk=c.chunk), False),
+    "dendritic_rec": MixerSpec(
+        lambda w, c: RecurrentDendriticBlock(c.d_model, d_inner=_w(w), d_state=c.d_state,
+                                             conv_k=c.conv_k), False),
 }
 MODELS = list(MIXERS)
 

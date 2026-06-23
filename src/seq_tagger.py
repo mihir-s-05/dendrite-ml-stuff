@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from src.blocks import SwiGLU
 from src.counting import size_to_budget
 from src.ssm import (CoincidenceSSM, DendriticSSMBlock, MambaBlock,
-                     RecurrentDendriticBlock)
+                     RecurrentDendriticBlock, RotationRecurrentBlock)
 
 
 class CausalAttention(nn.Module):
@@ -88,6 +88,9 @@ MIXERS: dict[str, MixerSpec] = {
     "dendritic_rec": MixerSpec(
         lambda w, c: RecurrentDendriticBlock(c.d_model, d_inner=_w(w), d_state=c.d_state,
                                              conv_k=c.conv_k), False),
+    "dendritic_rot": MixerSpec(
+        lambda w, c: RotationRecurrentBlock(c.d_model, d_inner=_w(w), d_state=c.d_state,
+                                            conv_k=c.conv_k), False),
 }
 MODELS = list(MIXERS)
 

@@ -171,6 +171,85 @@ class PlateauRecurrentSSM(nn.Module):
         return y + x * self.D
 
 
+class RotationRecurrentSSM(nn.Module):
+    """Selective COMPLEX recurrence: an input-dependent ROTATION in the loop.
+
+    ``PlateauRecurrentSSM`` carries a real state whose per-step factor is a
+    signed scalar -- a 2-cycle (parity), nothing more, because a diagonal real
+    recurrence cannot rotate. Here each (channel, state) carries a 2D / complex
+    state ``z = (zr, zi)`` whose per-step eigenvalue is ``rho * e^{i*theta}``:
+
+        z_t = plateau_radial( rho_t * R(theta_t) z_{t-1} + b_t )
+
+    ``theta_t`` is an input-dependent rotation angle, so the recurrence can learn
+    to advance phase by ``2*pi/k`` per increment and realize an arbitrary k-cycle
+    (mod-k counter); ``rho_t = exp(dt*A) in (0,1]`` is the selective magnitude
+    decay. The radial plateau ``tanh(gain*|z|)`` (gain>1) is regenerative near 0
+    and saturating for large |z|, giving a stable NONZERO fixed radius -- an
+    attracting ring -- so the rotor persists across long gaps and the state stays
+    bounded, which is what lets it length-generalize. Phase is preserved (the
+    nonlinearity scales magnitude only), so the rotation stays exact.
+
+    The angle inits near 0 (so the block starts as a plain real decaying SSM and
+    learns to rotate from there). Sequential scan; per-step terms built in-loop.
+    """
+
+    def __init__(self, d_inner: int, d_state: int = 8, dt_rank: int | None = None,
+                 dt_min: float = 1e-3, dt_max: float = 1e-1):
+        super().__init__()
+        self.d_inner = d_inner
+        self.d_state = d_state
+        self.dt_rank = dt_rank or max(1, d_inner // 16)
+        # proj -> [dt, B(drive), C_re, C_im]
+        self.x_proj = nn.Linear(d_inner, self.dt_rank + 3 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, d_inner, bias=True)
+        self.theta_proj = nn.Linear(d_inner, d_inner, bias=True)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(d_inner))
+        # Radial plateau gain per channel; softplus(raw)+1 > 1 => attracting ring.
+        self.gain_raw = nn.Parameter(torch.zeros(d_inner))
+
+        dt = torch.exp(
+            torch.rand(d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        ).clamp(min=1e-4)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+            # Start near zero rotation: behaves like a plain real decaying SSM,
+            # then learns the per-increment angle (e.g. 2*pi/k) during training.
+            self.theta_proj.weight.mul_(0.1)
+            self.theta_proj.bias.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, d = x.shape
+        proj = self.x_proj(x)
+        dt, Bp, Cr, Ci = torch.split(
+            proj, [self.dt_rank, self.d_state, self.d_state, self.d_state], dim=-1)
+        dt = F.softplus(self.dt_proj(dt))                      # (B, L, d_inner)
+        theta = self.theta_proj(x)                             # (B, L, d_inner)
+        A = -torch.exp(self.A_log)                             # (d_inner, d_state)
+        gain = (F.softplus(self.gain_raw) + 1.0).unsqueeze(-1)  # (d_inner, 1) > 1
+
+        zr = x.new_zeros(B, d, self.d_state)
+        zi = x.new_zeros(B, d, self.d_state)
+        outs = []
+        for t in range(L):
+            rho = torch.exp(dt[:, t].unsqueeze(-1) * A)        # (B, d, n) in (0,1]
+            th = theta[:, t].unsqueeze(-1)                     # (B, d, 1)
+            cos, sin = torch.cos(th), torch.sin(th)
+            b_t = (dt[:, t] * x[:, t]).unsqueeze(-1) * Bp[:, t].unsqueeze(1)
+            zr_lin = rho * (cos * zr - sin * zi) + b_t         # rotate + decay + drive
+            zi_lin = rho * (sin * zr + cos * zi)
+            mag = torch.sqrt(zr_lin * zr_lin + zi_lin * zi_lin + 1e-8)
+            scale = torch.tanh(gain * mag) / mag               # radial plateau (phase-safe)
+            zr, zi = zr_lin * scale, zi_lin * scale
+            yt = (zr * Cr[:, t].unsqueeze(1) + zi * Ci[:, t].unsqueeze(1)).sum(-1)
+            outs.append(yt)                                    # (B, d)
+        y = torch.stack(outs, dim=1)                           # (B, L, d)
+        return y + x * self.D
+
+
 class GatedSSMBlock(nn.Module):
     """Shared Mamba-style scaffold for the SSM block family.
 
@@ -333,6 +412,24 @@ class RecurrentDendriticBlock(GatedSSMBlock):
                  chunk: int = 8):
         super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
         self.ssm = PlateauRecurrentSSM(self.d_inner, d_state, dt_rank)
+
+    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
+        return self.ssm(streams[0])
+
+
+class RotationRecurrentBlock(GatedSSMBlock):
+    """Gated block wrapping ``RotationRecurrentSSM`` (selective rotation in loop).
+
+    Same scaffold as the other blocks; the core is the complex/rotation
+    recurrence that generalizes the signed-gate 2-cycle to arbitrary k-cycles.
+    ``chunk`` is accepted for call-site uniformity but ignored (sequential scan).
+    """
+
+    def __init__(self, d_model: int, d_inner: int | None = None, d_state: int = 8,
+                 dt_rank: int | None = None, conv_k: int = 4, expand: int = 2,
+                 chunk: int = 8):
+        super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
+        self.ssm = RotationRecurrentSSM(self.d_inner, d_state, dt_rank)
 
     def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
         return self.ssm(streams[0])

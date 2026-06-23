@@ -73,6 +73,31 @@ def make_streaming_parity(n_samples: int, seq_len: int, seed: int = 0, p: float 
     return bits, parity
 
 
+def make_streaming_modk(n_samples: int, seq_len: int, k: int = 3, seed: int = 0,
+                        p: float = 0.5):
+    """Streaming mod-k counter: the multi-bit generalization of streaming parity.
+
+    Each sample is a random {0,1} increment stream; the target at every timestep
+    is ``(number of 1s so far) mod k``, an integer in ``{0,...,k-1}``. Returns:
+        X: (n_samples, seq_len) int64 increments in {0,1}
+        y: (n_samples, seq_len) int64 running count mod k
+
+    ``k=2`` is exactly streaming parity. For ``k>2`` the running state needs more
+    than one bit (a k-state cyclic automaton), so a single sign-flip recurrence
+    cannot solve it -- it tests whether the in-loop nonlinear gate can hold a
+    *multi-bit* length-invariant state, not just a parity bit. Like parity, a
+    linear recurrence can track the raw count but recovering count mod k is a
+    periodic per-step nonlinearity it must memorize, so it fails to length-
+    generalize.
+    """
+    if k < 2:
+        raise ValueError(f"need k >= 2, got k={k}")
+    rng = np.random.default_rng(seed)
+    bits = (rng.random((n_samples, seq_len)) < p).astype(np.int64)
+    y = (np.cumsum(bits, axis=1) % k).astype(np.int64)
+    return bits, y
+
+
 def make_dataset(
     d: int,
     fn: Callable[[np.ndarray], np.ndarray],

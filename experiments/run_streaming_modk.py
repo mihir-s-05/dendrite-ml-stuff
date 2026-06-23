@@ -1,21 +1,20 @@
-"""Streaming parity (running XOR): an autoregressive STATE-TRACKING test.
+"""Streaming mod-k counter: the MULTI-BIT generalization of streaming parity.
 
-At each timestep the model reads a bit and must output the parity of all bits so
-far. This is the autoregressive analogue of the long-range coincidence tasks:
-it asks whether the dendritic block's plateau x multiplicative coincidence buys
-genuine state-tracking that a flat selective SSM (Mamba) or attention lack --
-and, crucially, whether it LENGTH-GENERALIZES (train short, test long), which is
-the honest discriminator. A model that only memorizes a count->parity readout
-fits the training length but degrades as sequences grow; a model that maintains
-a bounded parity state holds up.
+At each timestep the model reads a {0,1} increment and must output the running
+count mod k. Parity is the k=2 special case (1 bit of state); k>2 needs a
+k-state cyclic automaton, i.e. MORE than one bit of carried state, which a single
+sign-flip recurrence cannot represent. This is the honest test of whether the
+"regenerative nonlinearity in the loop" (the dendritic_rec block) is a general
+length-invariant state-tracking mechanism or merely a parity-specific trick: a
+true state machine length-generalizes (train short, test long); a count->readout
+memorizer fits the train length and decays to chance (1/k) as sequences grow.
 
-The model scaffold (mixer zoo, sizing, per-position tagger) is shared with the
-mod-k experiment and lives in ``src.seq_tagger``; this file owns the parity
-task, the binary loss, and the length-generalization reporting.
+Shares the model scaffold with the parity experiment (``src.seq_tagger``); this
+file owns the mod-k task, the multi-class loss, and the reporting.
 
 Usage:
-    uv run --no-sync python -u experiments/run_streaming_parity.py --preset cpu
-    uv run --no-sync python -u experiments/run_streaming_parity.py --preset gpu3080 --device cuda
+    uv run --no-sync python -u experiments/run_streaming_modk.py --preset cpu
+    uv run --no-sync python -u experiments/run_streaming_modk.py --preset gpu3080 --device cuda --mod 3
 """
 
 from __future__ import annotations
@@ -32,36 +31,35 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir))
 
 from src.counting import count_params
 from src.seq_tagger import MIXERS, MODELS, CausalAttention, MixerCfg, SeqTagger, sized_mixer
-from src.tasks import make_streaming_parity
+from src.tasks import make_streaming_modk
 from src.train import pick_device, set_seed
 
 
-def batch(rng: np.random.Generator, bs: int, seq_len: int, device: str):
-    bits, par = make_streaming_parity(bs, seq_len, seed=int(rng.integers(1 << 31)))
-    return (torch.from_numpy(bits).to(device), torch.from_numpy(par).to(device))
+def batch(rng: np.random.Generator, bs: int, seq_len: int, k: int, device: str):
+    bits, y = make_streaming_modk(bs, seq_len, k=k, seed=int(rng.integers(1 << 31)))
+    return (torch.from_numpy(bits).to(device), torch.from_numpy(y).to(device))
 
 
 @torch.no_grad()
-def evaluate(model, seq_len: int, device: str, n: int = 2048, seed: int = 999,
+def evaluate(model, seq_len: int, k: int, device: str, n: int = 2048, seed: int = 999,
              token_budget: int = 16384):
     """Per-position and final-position accuracy on a fixed eval set.
 
-    Batched with a constant token budget (rows*seq_len) so peak memory stays flat
-    across eval lengths -- the SSM scan materializes a (rows, L, d_inner, d_state)
-    tensor, which OOMs at long L if the whole eval set is run in one pass.
+    Batched with a constant token budget so peak memory stays flat across eval
+    lengths (the SSM scan materializes a (rows, L, d_inner, d_state) tensor).
     """
     model.eval()
-    bits_all, par_all = make_streaming_parity(n, seq_len, seed=seed)
+    bits_all, y_all = make_streaming_modk(n, seq_len, k=k, seed=seed)
     eval_bs = max(8, min(n, token_budget // seq_len))
     pp_correct = pp_total = fin_correct = fin_total = 0
     for i in range(0, n, eval_bs):
         bits = torch.from_numpy(bits_all[i:i + eval_bs]).to(device)
-        par = torch.from_numpy(par_all[i:i + eval_bs]).to(device)
-        pred = (model(bits) > 0).float()
-        pp_correct += (pred == par).float().sum().item()
-        pp_total += par.numel()
-        fin_correct += (pred[:, -1] == par[:, -1]).float().sum().item()
-        fin_total += par.shape[0]
+        y = torch.from_numpy(y_all[i:i + eval_bs]).to(device)
+        pred = model(bits).argmax(dim=-1)                 # (B, T)
+        pp_correct += (pred == y).float().sum().item()
+        pp_total += y.numel()
+        fin_correct += (pred[:, -1] == y[:, -1]).float().sum().item()
+        fin_total += y.shape[0]
     return pp_correct / pp_total, fin_correct / fin_total
 
 
@@ -82,6 +80,7 @@ def parse_args():
     ap.add_argument("--models", nargs="+", default=MODELS)
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--mod", type=int, default=3, help="counter modulus k (k=2 is parity)")
     for name, typ in [("d-model", int), ("n-layers", int), ("n-heads", int),
                       ("train-len", int), ("batch-size", int), ("steps", int),
                       ("lr", float), ("ffn-mult", int), ("d-state", int),
@@ -102,6 +101,8 @@ def configure(args):
     unknown = [m for m in args.models if m not in MIXERS]
     if unknown:
         raise ValueError(f"Unknown models: {unknown}")
+    if args.mod < 2:
+        raise ValueError(f"--mod must be >= 2, got {args.mod}")
     args.device = pick_device(args.device)
     if args.device == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -116,18 +117,20 @@ def train_one(name, cfg, args, target_params, seed):
     make_mixer, use_pos = sized_mixer(name, target_params, cfg)
     max_len = max(args.eval_lens + [args.train_len])
     model = SeqTagger(args.d_model, args.n_layers, make_mixer,
-                      args.ffn_mult * args.d_model, max_len, use_pos, n_out=1).to(args.device)
+                      args.ffn_mult * args.d_model, max_len, use_pos,
+                      n_out=args.mod).to(args.device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.CrossEntropyLoss()
     rng = np.random.default_rng(seed)
     model.train()
     for step in range(args.steps):
-        bits, par = batch(rng, args.batch_size, args.train_len, args.device)
-        loss = loss_fn(model(bits), par)
+        bits, y = batch(rng, args.batch_size, args.train_len, args.mod, args.device)
+        logits = model(bits)                              # (B, T, k)
+        loss = loss_fn(logits.reshape(-1, args.mod), y.reshape(-1))
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-    accs = {L: evaluate(model, L, args.device) for L in args.eval_lens}
+    accs = {L: evaluate(model, L, args.mod, args.device) for L in args.eval_lens}
     return accs, count_params(model.blocks[0].mix)
 
 
@@ -135,22 +138,21 @@ def main():
     args = parse_args()
     cfg = configure(args)
 
-    # Budget = the attention mixer's param count; SSM mixers are sized to match.
     target_params = count_params(CausalAttention(args.d_model, args.n_heads))
-    print(f"\nDevice: {args.device} (preset={args.preset}). "
-          f"d_model={args.d_model} x{args.n_layers}L, train_len={args.train_len}, "
-          f"eval_lens={args.eval_lens}, per-mixer budget~{target_params}, "
-          f"seeds={args.seeds}.\n")
+    print(f"\nDevice: {args.device} (preset={args.preset}). mod k={args.mod} "
+          f"(chance={100.0/args.mod:.1f}%). d_model={args.d_model} x{args.n_layers}L, "
+          f"train_len={args.train_len}, eval_lens={args.eval_lens}, "
+          f"per-mixer budget~{target_params}, seeds={args.seeds}.\n")
     print("Mixer sizes:")
     for m in args.models:
         make_mixer, _ = sized_mixer(m, target_params, cfg)
         print(f"  {m:14s} mixer_params={count_params(make_mixer())}")
 
     seeds = list(range(args.seeds))
-    # acc[model][L] = list of (per_pos, final) over seeds
     results: dict[str, dict[int, list]] = {m: {L: [] for L in args.eval_lens}
                                            for m in args.models}
-    print("\n=== TRAINING (per-position acc / final-position acc, by eval length) ===")
+    print(f"\n=== TRAINING (per-position acc / final-position acc, by eval length; "
+          f"mod {args.mod}) ===")
     for m in args.models:
         for s in seeds:
             accs, mp = train_one(m, cfg, args, target_params, s)
@@ -160,7 +162,8 @@ def main():
                               for L in args.eval_lens)
             print(f"  [{m:14s} seed={s}] {shown}", flush=True)
 
-    print("\n=== STREAMING PARITY (per-position acc %, mean over seeds) ===")
+    print(f"\n=== STREAMING MOD-{args.mod} (per-position acc %, mean over seeds; "
+          f"chance={100.0/args.mod:.1f}%) ===")
     print("  model           " + "".join(f"{'L='+str(L):>10s}" for L in args.eval_lens))
     for m in args.models:
         line = f"  {m:14s}  "
@@ -168,7 +171,8 @@ def main():
             pp = np.mean([v[0] for v in results[m][L]]) * 100
             line += f"{pp:>10.1f}"
         print(line)
-    print("\n=== final-position acc % (the hard bit: parity of the whole stream) ===")
+    print(f"\n=== final-position acc % (the hard bit: count mod {args.mod} of the "
+          f"whole stream) ===")
     print("  model           " + "".join(f"{'L='+str(L):>10s}" for L in args.eval_lens))
     for m in args.models:
         line = f"  {m:14s}  "

@@ -257,16 +257,18 @@ class QuantizedRotationSSM(nn.Module):
     mod-k but drifts at long lengths: nothing forces the angle to be exactly
     ``2*pi/k``, and the phase error grows ~ length * delta_theta (final-position
     acc falls *below* chance -- the drift signature). Here the per-step angle is
-    chosen, per (channel, step), from a FIXED grid ``2*pi*j/n_bins`` via a
-    straight-through one-hot: the forward rotation is therefore one of the grid
-    angles *exactly*, so if ``n_bins`` is a multiple of k the model can pick the
-    exact ``2*pi/k`` and accumulate ZERO drift -> length generalizes arbitrarily.
-    Gradients flow through the softmax (straight-through), so the input-dependent
-    selection stays trainable.
+    snapped, per (channel, step), to the nearest multiple of ``2*pi/n_bins`` by
+    straight-through ROUNDING: the forward rotation is therefore an exact grid
+    angle, so if ``n_bins`` is a multiple of k the model can realize the exact
+    ``2*pi/k`` and accumulate ZERO drift -> length generalizes arbitrarily.
+    Gradients flow as if unrounded, so the input-dependent angle stays trainable.
+    Rounding (rather than a categorical over n_bins) keeps the angle projection
+    at ``d_inner^2`` cost, so grid resolution is free and d_inner is not starved
+    -- the categorical variant spent the whole budget on ``d_inner*n_bins``
+    logits, shrinking the recurrence and crippling it at fine grids.
 
     Everything else matches ``RotationRecurrentSSM`` (selective magnitude decay,
-    phase-safe radial plateau, complex readout). Cos/sin are read from exact grid
-    tables so no floating-point angle error enters the recurrence.
+    phase-safe radial plateau, complex readout).
     """
 
     def __init__(self, d_inner: int, d_state: int = 8, dt_rank: int | None = None,
@@ -276,18 +278,16 @@ class QuantizedRotationSSM(nn.Module):
         self.d_state = d_state
         self.dt_rank = dt_rank or max(1, d_inner // 16)
         self.n_bins = n_bins
+        self.delta = 2 * math.pi / n_bins                      # angle grid spacing
         self.x_proj = nn.Linear(d_inner, self.dt_rank + 3 * d_state, bias=False)
         self.dt_proj = nn.Linear(self.dt_rank, d_inner, bias=True)
-        # Per-channel logits over the n_bins candidate rotation angles.
-        self.angle_proj = nn.Linear(d_inner, d_inner * n_bins, bias=True)
+        # Continuous per-channel angle (d_inner^2 cost, like the free rotor),
+        # snapped to the grid by straight-through rounding in forward().
+        self.theta_proj = nn.Linear(d_inner, d_inner, bias=True)
         A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_inner, 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(d_inner))
         self.gain_raw = nn.Parameter(torch.zeros(d_inner))
-
-        grid = 2 * math.pi * torch.arange(n_bins, dtype=torch.float32) / n_bins
-        self.register_buffer("cos_grid", torch.cos(grid))       # (n_bins,) exact
-        self.register_buffer("sin_grid", torch.sin(grid))
 
         dt = torch.exp(
             torch.rand(d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
@@ -295,11 +295,10 @@ class QuantizedRotationSSM(nn.Module):
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
             self.dt_proj.bias.copy_(inv_dt)
-            # Small logits + bias toward bin 0 (angle 0): starts as a plain real
-            # decaying SSM, then learns which input advances which exact angle.
-            self.angle_proj.weight.mul_(0.1)
-            self.angle_proj.bias.zero_()
-            self.angle_proj.bias.view(d_inner, n_bins)[:, 0] = 2.0
+            # Start near zero rotation (snaps to angle 0): plain real decaying SSM,
+            # then learns which input advances the angle to an exact grid multiple.
+            self.theta_proj.weight.mul_(0.1)
+            self.theta_proj.bias.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, d = x.shape
@@ -310,14 +309,14 @@ class QuantizedRotationSSM(nn.Module):
         A = -torch.exp(self.A_log)                             # (d_inner, d_state)
         gain = (F.softplus(self.gain_raw) + 1.0).unsqueeze(-1)  # (d_inner, 1) > 1
 
-        # Straight-through one-hot angle selection on the exact grid.
-        logits = self.angle_proj(x).view(B, L, d, self.n_bins)
-        probs = F.softmax(logits, dim=-1)
-        idx = probs.argmax(dim=-1, keepdim=True)
-        hard = torch.zeros_like(probs).scatter_(-1, idx, 1.0)
-        sel = hard + probs - probs.detach()                   # ST: exact fwd, soft grad
-        cos_a = (sel * self.cos_grid).sum(-1)                 # (B, L, d) exact grid cos
-        sin_a = (sel * self.sin_grid).sum(-1)
+        # Straight-through rounding: snap the continuous angle to the nearest grid
+        # multiple of delta in the forward pass (so the realized rotation is an
+        # exact rational angle -> zero drift); gradient flows as if unrounded.
+        theta = self.theta_proj(x)                            # (B, L, d) continuous
+        theta_q = torch.round(theta / self.delta) * self.delta
+        theta = theta + (theta_q - theta).detach()            # ST exact-angle snap
+        cos_a = torch.cos(theta)                              # (B, L, d)
+        sin_a = torch.sin(theta)
 
         zr = x.new_zeros(B, d, self.d_state)
         zi = x.new_zeros(B, d, self.d_state)

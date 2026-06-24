@@ -25,7 +25,8 @@ import torch.nn.functional as F
 from src.blocks import SwiGLU
 from src.counting import size_to_budget
 from src.ssm import (CoincidenceSSM, DendriticSSMBlock, MambaBlock,
-                     RecurrentDendriticBlock, RotationRecurrentBlock)
+                     QuantizedRotationBlock, RecurrentDendriticBlock,
+                     RotationRecurrentBlock)
 
 
 class CausalAttention(nn.Module):
@@ -67,6 +68,7 @@ class MixerCfg:
     conv_k: int
     n_branches: int
     chunk: int
+    rot_bins: int = 12
 
 
 def _w(w: int) -> int:
@@ -91,6 +93,9 @@ MIXERS: dict[str, MixerSpec] = {
     "dendritic_rot": MixerSpec(
         lambda w, c: RotationRecurrentBlock(c.d_model, d_inner=_w(w), d_state=c.d_state,
                                             conv_k=c.conv_k), False),
+    "dendritic_qrot": MixerSpec(
+        lambda w, c: QuantizedRotationBlock(c.d_model, d_inner=_w(w), d_state=c.d_state,
+                                            conv_k=c.conv_k, n_bins=c.rot_bins), False),
 }
 MODELS = list(MIXERS)
 

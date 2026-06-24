@@ -81,6 +81,9 @@ def parse_args():
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--mod", type=int, default=3, help="counter modulus k (k=2 is parity)")
+    ap.add_argument("--rot-bins", type=int, default=None,
+                    help="angle-grid size for dendritic_qrot (default: 4*mod, a multiple "
+                         "of k so the exact 2*pi/k angle is representable)")
     for name, typ in [("d-model", int), ("n-layers", int), ("n-heads", int),
                       ("train-len", int), ("batch-size", int), ("steps", int),
                       ("lr", float), ("ffn-mult", int), ("d-state", int),
@@ -103,13 +106,16 @@ def configure(args):
         raise ValueError(f"Unknown models: {unknown}")
     if args.mod < 2:
         raise ValueError(f"--mod must be >= 2, got {args.mod}")
+    if args.rot_bins is None:
+        args.rot_bins = 4 * args.mod
     args.device = pick_device(args.device)
     if args.device == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
     return MixerCfg(d_model=args.d_model, n_heads=args.n_heads, d_state=args.d_state,
-                    conv_k=args.conv_k, n_branches=args.n_branches, chunk=args.chunk)
+                    conv_k=args.conv_k, n_branches=args.n_branches, chunk=args.chunk,
+                    rot_bins=args.rot_bins)
 
 
 def train_one(name, cfg, args, target_params, seed):
@@ -142,7 +148,8 @@ def main():
     print(f"\nDevice: {args.device} (preset={args.preset}). mod k={args.mod} "
           f"(chance={100.0/args.mod:.1f}%). d_model={args.d_model} x{args.n_layers}L, "
           f"train_len={args.train_len}, eval_lens={args.eval_lens}, "
-          f"per-mixer budget~{target_params}, seeds={args.seeds}.\n")
+          f"per-mixer budget~{target_params}, rot_bins={args.rot_bins}, "
+          f"seeds={args.seeds}.\n")
     print("Mixer sizes:")
     for m in args.models:
         make_mixer, _ = sized_mixer(m, target_params, cfg)

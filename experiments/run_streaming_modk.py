@@ -84,6 +84,9 @@ def parse_args():
     ap.add_argument("--rot-bins", type=int, default=None,
                     help="angle-grid size for dendritic_qrot (default: 4*mod, a multiple "
                          "of k so the exact 2*pi/k angle is representable)")
+    ap.add_argument("--snap-warmup-frac", type=float, default=0.5,
+                    help="dendritic_qrot: fraction of training over which the angle snap "
+                         "is annealed soft->hard (0 = hard from step 0)")
     for name, typ in [("d-model", int), ("n-layers", int), ("n-heads", int),
                       ("train-len", int), ("batch-size", int), ("steps", int),
                       ("lr", float), ("ffn-mult", int), ("d-state", int),
@@ -128,14 +131,23 @@ def train_one(name, cfg, args, target_params, seed):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     loss_fn = nn.CrossEntropyLoss()
     rng = np.random.default_rng(seed)
+
+    def set_snap(val):  # ramp the qrot angle-snap hardness (no-op for other models)
+        for mod in model.modules():
+            if hasattr(mod, "snap_alpha"):
+                mod.snap_alpha.fill_(val)
+
+    warmup = max(1, int(args.snap_warmup_frac * args.steps))
     model.train()
     for step in range(args.steps):
+        set_snap(min(1.0, step / warmup))
         bits, y = batch(rng, args.batch_size, args.train_len, args.mod, args.device)
         logits = model(bits)                              # (B, T, k)
         loss = loss_fn(logits.reshape(-1, args.mod), y.reshape(-1))
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+    set_snap(1.0)                                         # full exact snap for eval
     accs = {L: evaluate(model, L, args.mod, args.device) for L in args.eval_lens}
     return accs, count_params(model.blocks[0].mix)
 

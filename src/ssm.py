@@ -267,6 +267,14 @@ class QuantizedRotationSSM(nn.Module):
     -- the categorical variant spent the whole budget on ``d_inner*n_bins``
     logits, shrinking the recurrence and crippling it at fine grids.
 
+    Snap annealing: hard snapping from step 0 is a non-smooth landscape, so the
+    angle locks into the exact bin only on lucky seeds (reliable-but-approximate
+    free rotor vs exact-but-flaky hard snap). ``snap_alpha`` blends the continuous
+    and snapped angle; the training loop ramps it 0 -> 1 so optimization starts
+    smooth (like the free rotor) and hardens to the exact grid, giving reliable
+    locking AND zero drift. ``snap_alpha=1`` (the default / eval value) is a full
+    exact snap.
+
     Everything else matches ``RotationRecurrentSSM`` (selective magnitude decay,
     phase-safe radial plateau, complex readout).
     """
@@ -288,6 +296,8 @@ class QuantizedRotationSSM(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(d_inner))
         self.gain_raw = nn.Parameter(torch.zeros(d_inner))
+        # Snap hardness in [0,1]; ramped 0->1 by the training loop, 1 at eval.
+        self.register_buffer("snap_alpha", torch.tensor(1.0))
 
         dt = torch.exp(
             torch.rand(d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
@@ -314,7 +324,9 @@ class QuantizedRotationSSM(nn.Module):
         # exact rational angle -> zero drift); gradient flows as if unrounded.
         theta = self.theta_proj(x)                            # (B, L, d) continuous
         theta_q = torch.round(theta / self.delta) * self.delta
-        theta = theta + (theta_q - theta).detach()            # ST exact-angle snap
+        theta_hard = theta + (theta_q - theta).detach()       # ST exact-angle snap
+        a = self.snap_alpha
+        theta = (1.0 - a) * theta + a * theta_hard            # anneal soft -> hard
         cos_a = torch.cos(theta)                              # (B, L, d)
         sin_a = torch.sin(theta)
 

@@ -98,6 +98,42 @@ def make_streaming_modk(n_samples: int, seq_len: int, k: int = 3, seed: int = 0,
     return bits, y
 
 
+S3_SIZE = 6  # |S_3|: input alphabet and number of output classes
+
+
+def make_streaming_s3(n_samples: int, seq_len: int, seed: int = 0):
+    """Streaming S_3 word problem: running composition in the symmetric group S_3.
+
+    Each step reads a random element of S_3 (one of the 6 permutations of three
+    items, as an index in 0..5); the target at each step is the running product
+    g_1 . g_2 . ... . g_t (also an index in 0..5). Returns:
+        X: (n_samples, seq_len) int64 input element indices in {0..5}
+        y: (n_samples, seq_len) int64 running-composition index in {0..5}
+
+    Unlike parity / mod-k (which are CYCLIC, i.e. abelian, groups), S_3 is the
+    smallest NON-abelian group: order matters, so the state cannot be recovered
+    from a count or a single rotation (rotations form an abelian subgroup). This
+    tests whether the in-loop rotation mechanism is a general finite-state
+    tracker or specifically a cyclic-counter specialist. Chance is 1/6 ~ 16.7%.
+    """
+    elems = list(itertools.permutations(range(3)))
+    idx = {e: i for i, e in enumerate(elems)}
+    n = len(elems)
+    table = np.empty((n, n), dtype=np.int64)              # Cayley table: (a . b)
+    for i, a in enumerate(elems):
+        for j, b in enumerate(elems):
+            table[i, j] = idx[tuple(a[b[k]] for k in range(3))]
+    ident = idx[(0, 1, 2)]
+    rng = np.random.default_rng(seed)
+    x = rng.integers(0, n, size=(n_samples, seq_len)).astype(np.int64)
+    y = np.empty((n_samples, seq_len), dtype=np.int64)
+    cur = np.full(n_samples, ident, dtype=np.int64)
+    for t in range(seq_len):
+        cur = table[cur, x[:, t]]                          # P_t = P_{t-1} . g_t
+        y[:, t] = cur
+    return x, y
+
+
 def make_dataset(
     d: int,
     fn: Callable[[np.ndarray], np.ndarray],

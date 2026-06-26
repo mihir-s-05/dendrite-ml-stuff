@@ -131,14 +131,16 @@ class SeqTagger(nn.Module):
 
     ``n_out=1`` returns ``(B, T)`` logits for a binary (BCE) target; ``n_out>1``
     returns ``(B, T, n_out)`` class logits for a multi-class (cross-entropy)
-    target. The input alphabet is binary in both cases (a {0,1} stream).
+    target. The input alphabet has ``n_in`` symbols (2 for the bit-stream tasks,
+    |group| for the group word problems).
     """
 
     def __init__(self, d_model: int, n_layers: int, make_mixer: Callable[[], nn.Module],
-                 ffn_hidden: int, max_len: int, use_pos: bool, n_out: int = 1):
+                 ffn_hidden: int, max_len: int, use_pos: bool, n_out: int = 1,
+                 n_in: int = 2):
         super().__init__()
         self.n_out = n_out
-        self.emb = nn.Embedding(2, d_model)
+        self.emb = nn.Embedding(n_in, d_model)
         self.pos = nn.Embedding(max_len, d_model) if use_pos else None
         self.blocks = nn.ModuleList(
             Block(d_model, make_mixer, ffn_hidden) for _ in range(n_layers))

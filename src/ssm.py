@@ -349,6 +349,119 @@ class QuantizedRotationSSM(nn.Module):
         return y + x * self.D
 
 
+class OrthogonalRecurrentSSM(nn.Module):
+    """Selective O(2) recurrence: an input-dependent ROTATION-OR-REFLECTION.
+
+    ``RotationRecurrentSSM``/``QuantizedRotationSSM`` apply an SO(2) rotation per
+    step (det = +1). Rotations form an *abelian* subgroup, so they represent
+    cyclic state (parity, mod-k) but not non-abelian state: S_3 = D_3 is generated
+    by a 3-cycle (rotation by 2*pi/3) AND a transposition (a *reflection*, det =
+    -1), which no rotation can produce. On the S_3 word problem the pure rotation
+    therefore collapses past the train length while the more expressive signed
+    gate does better -- the reflection is the missing ingredient.
+
+    Here the per-step 2x2 map is a full O(2) element, selected input-dependently
+    between rotation and reflection by a sign ``s_t in {-1,+1}``:
+
+        M(theta, s) = [[cos t, -s sin t], [sin t, s cos t]],   det M = s
+
+    ``s=+1`` recovers the rotation ``R(theta)``; ``s=-1`` is a reflection. Rotation
+    (R(2*pi/3)) and reflection together generate D_3 ~= S_3, so the recurrence can
+    represent the 2D irrep of S_3 (and any dihedral group) exactly.
+
+        z_t = plateau_radial( rho_t * M(theta_t, s_t) z_{t-1} + b_t )
+
+    Both the angle and the sign are snapped to exact values by straight-through
+    estimation so the realized transform is an exact O(2) element (zero drift ->
+    length generalization): the angle to the ``2*pi/n_bins`` grid (as in
+    ``QuantizedRotationSSM``) and the sign to {-1,+1}. ``snap_alpha`` (ramped 0->1
+    by the training loop) anneals BOTH snaps soft->hard so optimization starts on
+    a smooth landscape and hardens to exact group elements. ``rho_t`` is the usual
+    selective magnitude decay; the phase/geometry-safe radial plateau keeps the
+    state on an attracting ring (reflections preserve magnitude, so the plateau is
+    valid for the full O(2) action).
+
+    Inits as a pure (quantized) rotation -- angle ~0, sign ~+1 -- so it starts
+    exactly like the rotation block and learns to recruit reflections from there.
+    Sequential scan; per-step terms built in-loop.
+    """
+
+    def __init__(self, d_inner: int, d_state: int = 8, dt_rank: int | None = None,
+                 n_bins: int = 12, dt_min: float = 1e-3, dt_max: float = 1e-1):
+        super().__init__()
+        self.d_inner = d_inner
+        self.d_state = d_state
+        self.dt_rank = dt_rank or max(1, d_inner // 16)
+        self.n_bins = n_bins
+        self.delta = 2 * math.pi / n_bins
+        self.x_proj = nn.Linear(d_inner, self.dt_rank + 3 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, d_inner, bias=True)
+        self.theta_proj = nn.Linear(d_inner, d_inner, bias=True)
+        self.sign_proj = nn.Linear(d_inner, d_inner, bias=True)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(d_inner))
+        self.gain_raw = nn.Parameter(torch.zeros(d_inner))
+        self.register_buffer("snap_alpha", torch.tensor(1.0))
+
+        dt = torch.exp(
+            torch.rand(d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        ).clamp(min=1e-4)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+            # Start as a pure rotation near angle 0: theta ~ 0 and the sign biased
+            # to +1 (det +1), so at init this is exactly the quantized rotor; it
+            # then learns which inputs flip the determinant (recruit reflections).
+            self.theta_proj.weight.mul_(0.1)
+            self.theta_proj.bias.zero_()
+            self.sign_proj.weight.mul_(0.1)
+            self.sign_proj.bias.fill_(2.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, d = x.shape
+        proj = self.x_proj(x)
+        dt, Bp, Cr, Ci = torch.split(
+            proj, [self.dt_rank, self.d_state, self.d_state, self.d_state], dim=-1)
+        dt = F.softplus(self.dt_proj(dt))                      # (B, L, d_inner)
+        A = -torch.exp(self.A_log)                             # (d_inner, d_state)
+        gain = (F.softplus(self.gain_raw) + 1.0).unsqueeze(-1)  # (d_inner, 1) > 1
+        a = self.snap_alpha
+
+        # Straight-through angle snap to the 2*pi/n_bins grid (exact rotation).
+        theta = self.theta_proj(x)                            # (B, L, d) continuous
+        theta_q = torch.round(theta / self.delta) * self.delta
+        theta_hard = theta + (theta_q - theta).detach()
+        theta = (1.0 - a) * theta + a * theta_hard            # anneal soft -> hard
+        cos_a = torch.cos(theta)                              # (B, L, d)
+        sin_a = torch.sin(theta)
+
+        # Straight-through sign snap to {-1,+1} (exact reflection vs rotation).
+        s_cont = torch.tanh(self.sign_proj(x))               # (B, L, d) in (-1,1)
+        s_hard_val = torch.where(s_cont >= 0, 1.0, -1.0)
+        s_hard = s_cont + (s_hard_val - s_cont).detach()
+        s_a = (1.0 - a) * s_cont + a * s_hard                 # anneal soft -> hard
+
+        zr = x.new_zeros(B, d, self.d_state)
+        zi = x.new_zeros(B, d, self.d_state)
+        outs = []
+        for t in range(L):
+            rho = torch.exp(dt[:, t].unsqueeze(-1) * A)        # (B, d, n) in (0,1]
+            cos = cos_a[:, t].unsqueeze(-1)                    # (B, d, 1)
+            sin = sin_a[:, t].unsqueeze(-1)
+            s = s_a[:, t].unsqueeze(-1)                        # (B, d, 1) ~ +/-1
+            b_t = (dt[:, t] * x[:, t]).unsqueeze(-1) * Bp[:, t].unsqueeze(1)
+            zr_lin = rho * (cos * zr - s * sin * zi) + b_t     # O(2): rotate/reflect
+            zi_lin = rho * (sin * zr + s * cos * zi)
+            mag = torch.sqrt(zr_lin * zr_lin + zi_lin * zi_lin + 1e-8)
+            scale = torch.tanh(gain * mag) / mag               # radial plateau (geometry-safe)
+            zr, zi = zr_lin * scale, zi_lin * scale
+            yt = (zr * Cr[:, t].unsqueeze(1) + zi * Ci[:, t].unsqueeze(1)).sum(-1)
+            outs.append(yt)                                    # (B, d)
+        y = torch.stack(outs, dim=1)                           # (B, L, d)
+        return y + x * self.D
+
+
 class GatedSSMBlock(nn.Module):
     """Shared Mamba-style scaffold for the SSM block family.
 
@@ -547,6 +660,25 @@ class QuantizedRotationBlock(GatedSSMBlock):
                  n_bins: int = 12, chunk: int = 8):
         super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
         self.ssm = QuantizedRotationSSM(self.d_inner, d_state, dt_rank, n_bins=n_bins)
+
+    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
+        return self.ssm(streams[0])
+
+
+class OrthogonalRecurrentBlock(GatedSSMBlock):
+    """Gated block wrapping ``OrthogonalRecurrentSSM`` (O(2) rotor+reflection).
+
+    Same scaffold as the other blocks; the core applies a per-step exact O(2)
+    transform (rotation OR reflection), which can represent dihedral / non-abelian
+    state (e.g. S_3 ~= D_3) that a pure rotation cannot. ``chunk`` is accepted for
+    call-site uniformity but ignored (the scan is sequential).
+    """
+
+    def __init__(self, d_model: int, d_inner: int | None = None, d_state: int = 8,
+                 dt_rank: int | None = None, conv_k: int = 4, expand: int = 2,
+                 n_bins: int = 12, chunk: int = 8):
+        super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
+        self.ssm = OrthogonalRecurrentSSM(self.d_inner, d_state, dt_rank, n_bins=n_bins)
 
     def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
         return self.ssm(streams[0])

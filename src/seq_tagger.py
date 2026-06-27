@@ -11,6 +11,9 @@ loss, and reporting.
   ssm_coinc      two selective-memory streams multiplied + plateau
   dendritic_ssm  tree of plateau-gated selective branches + multiplicative soma
   dendritic_rec  selective SSM with the regenerative + signed gate IN the loop
+  dendritic_rot  selective complex ROTATION (SO(2)) in the loop (cyclic groups)
+  dendritic_qrot rotation snapped to an exact angle grid (zero drift, mod-k)
+  dendritic_orth O(2) rotation-OR-reflection in the loop (dihedral/non-abelian)
 """
 
 from __future__ import annotations
@@ -25,8 +28,8 @@ import torch.nn.functional as F
 from src.blocks import SwiGLU
 from src.counting import size_to_budget
 from src.ssm import (CoincidenceSSM, DendriticSSMBlock, MambaBlock,
-                     QuantizedRotationBlock, RecurrentDendriticBlock,
-                     RotationRecurrentBlock)
+                     OrthogonalRecurrentBlock, QuantizedRotationBlock,
+                     RecurrentDendriticBlock, RotationRecurrentBlock)
 
 
 class CausalAttention(nn.Module):
@@ -96,6 +99,9 @@ MIXERS: dict[str, MixerSpec] = {
     "dendritic_qrot": MixerSpec(
         lambda w, c: QuantizedRotationBlock(c.d_model, d_inner=_w(w), d_state=c.d_state,
                                             conv_k=c.conv_k, n_bins=c.rot_bins), False),
+    "dendritic_orth": MixerSpec(
+        lambda w, c: OrthogonalRecurrentBlock(c.d_model, d_inner=_w(w), d_state=c.d_state,
+                                              conv_k=c.conv_k, n_bins=c.rot_bins), False),
 }
 MODELS = list(MIXERS)
 

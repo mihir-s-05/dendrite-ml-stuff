@@ -418,7 +418,35 @@ class OrthogonalRecurrentSSM(nn.Module):
             self.sign_proj.weight.mul_(0.1)
             self.sign_proj.bias.fill_(2.0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _snap_theta(self, theta: torch.Tensor) -> torch.Tensor:
+        """Straight-through snap of the angle to the 2*pi/n_bins grid, annealed
+        soft->hard by ``snap_alpha`` (exact rotation at alpha=1, zero drift)."""
+        a = self.snap_alpha
+        theta_q = torch.round(theta / self.delta) * self.delta
+        theta_hard = theta + (theta_q - theta).detach()
+        return (1.0 - a) * theta + a * theta_hard
+
+    def _snap_sign(self, s_cont: torch.Tensor) -> torch.Tensor:
+        """Straight-through snap of the reflection sign to {-1,+1}, annealed
+        soft->hard by ``snap_alpha`` (exact det = +/-1 at alpha=1)."""
+        a = self.snap_alpha
+        s_hard_val = torch.where(s_cont >= 0, 1.0, -1.0)
+        s_hard = s_cont + (s_hard_val - s_cont).detach()
+        return (1.0 - a) * s_cont + a * s_hard
+
+    def _orient(self, x: torch.Tensor, ids: torch.Tensor | None = None):
+        """Per-step O(2) orientation (cos, sin, sign), shape (B, L, d_inner) each.
+
+        Base block: a free per-channel continuous angle and sign, each snapped to
+        its exact grid. Subclasses override to source the angle/sign differently
+        (e.g. from the raw input symbol) while reusing the scan below; ``ids`` is
+        the (B, L) input-symbol tensor for symbol-conditioned variants.
+        """
+        theta = self._snap_theta(self.theta_proj(x))         # (B, L, d)
+        s_a = self._snap_sign(torch.tanh(self.sign_proj(x)))  # (B, L, d) ~ +/-1
+        return torch.cos(theta), torch.sin(theta), s_a
+
+    def forward(self, x: torch.Tensor, ids: torch.Tensor | None = None) -> torch.Tensor:
         B, L, d = x.shape
         proj = self.x_proj(x)
         dt, Bp, Cr, Ci = torch.split(
@@ -426,21 +454,7 @@ class OrthogonalRecurrentSSM(nn.Module):
         dt = F.softplus(self.dt_proj(dt))                      # (B, L, d_inner)
         A = -torch.exp(self.A_log)                             # (d_inner, d_state)
         gain = (F.softplus(self.gain_raw) + 1.0).unsqueeze(-1)  # (d_inner, 1) > 1
-        a = self.snap_alpha
-
-        # Straight-through angle snap to the 2*pi/n_bins grid (exact rotation).
-        theta = self.theta_proj(x)                            # (B, L, d) continuous
-        theta_q = torch.round(theta / self.delta) * self.delta
-        theta_hard = theta + (theta_q - theta).detach()
-        theta = (1.0 - a) * theta + a * theta_hard            # anneal soft -> hard
-        cos_a = torch.cos(theta)                              # (B, L, d)
-        sin_a = torch.sin(theta)
-
-        # Straight-through sign snap to {-1,+1} (exact reflection vs rotation).
-        s_cont = torch.tanh(self.sign_proj(x))               # (B, L, d) in (-1,1)
-        s_hard_val = torch.where(s_cont >= 0, 1.0, -1.0)
-        s_hard = s_cont + (s_hard_val - s_cont).detach()
-        s_a = (1.0 - a) * s_cont + a * s_hard                 # anneal soft -> hard
+        cos_a, sin_a, s_a = self._orient(x, ids)             # each (B, L, d)
 
         zr = x.new_zeros(B, d, self.d_state)
         zi = x.new_zeros(B, d, self.d_state)
@@ -460,6 +474,59 @@ class OrthogonalRecurrentSSM(nn.Module):
             outs.append(yt)                                    # (B, d)
         y = torch.stack(outs, dim=1)                           # (B, L, d)
         return y + x * self.D
+
+
+class SymbolicOrthogonalSSM(OrthogonalRecurrentSSM):
+    """O(2) recurrence whose transform is a fixed function of the INPUT SYMBOL.
+
+    ``OrthogonalRecurrentSSM`` reads a free per-channel angle and sign from the
+    continuous hidden state. It can *represent* S_3 exactly, but on the S_3 word
+    problem it length-generalizes only on some seeds and still drifts: the
+    remaining bottleneck is not capacity but reliable LOCKING -- each input symbol
+    must map to one exact O(2) transition, and free per-channel projections of a
+    context-mixed hidden state do not reliably converge to that map.
+
+    This variant bakes in the group-representation prior directly: a faithful rep
+    sends each of the ``n_in`` input symbols ``g`` to a single fixed matrix
+    ``rho(g)``. The per-step transform is indexed by the RAW input symbol ``ids``
+    (threaded in from the tagger, NOT read from the conv-mixed hidden state), and
+    is ONE scalar angle + ONE scalar sign per symbol, shared across all channels
+    -- i.e. every 2D plane of the state undergoes the *same* O(2) map, so the
+    block carries ``d_inner * d_state`` identical copies of a single 2D rep rather
+    than a per-channel bundle. The angle is snapped to the ``2*pi/n_bins`` grid
+    and the sign to {-1,+1} (annealed by ``snap_alpha``), so once learned each
+    symbol's transition is an exact group element -> zero drift.
+
+    Because the transition depends only on the symbol (the hidden state still
+    drives ``b_t`` and the readout), this is the clean test of "exact symbol ->
+    O(2) transition" locking. Inits as a pure rotor (angles ~0, signs ~+1) so it
+    starts like the rotation block and commits to per-symbol group elements as
+    ``snap_alpha`` ramps to 1.
+    """
+
+    def __init__(self, d_inner: int, d_state: int = 8, dt_rank: int | None = None,
+                 n_bins: int = 12, n_in: int = 2, dt_min: float = 1e-3,
+                 dt_max: float = 1e-1):
+        super().__init__(d_inner, d_state, dt_rank, n_bins=n_bins,
+                         dt_min=dt_min, dt_max=dt_max)
+        # The base built free per-channel angle/sign projections; this variant
+        # indexes one shared scalar angle/sign per input symbol instead.
+        del self.theta_proj
+        del self.sign_proj
+        self.n_in = n_in
+        self.theta_tab = nn.Parameter(torch.randn(n_in) * 0.05)   # ~0 angle / symbol
+        self.sign_tab = nn.Parameter(torch.full((n_in,), 2.0))    # ->+1 sign / symbol
+
+    def _orient(self, x: torch.Tensor, ids: torch.Tensor | None = None):
+        if ids is None:
+            raise ValueError("SymbolicOrthogonalSSM requires the input-symbol ids; "
+                             "the tagger must thread them through the block.")
+        d = x.shape[-1]
+        theta = self._snap_theta(self.theta_tab[ids])         # (B, L) per symbol
+        s_a = self._snap_sign(torch.tanh(self.sign_tab[ids]))  # (B, L) per symbol
+        theta = theta.unsqueeze(-1).expand(-1, -1, d)         # share across channels
+        s_a = s_a.unsqueeze(-1).expand(-1, -1, d)
+        return torch.cos(theta), torch.sin(theta), s_a
 
 
 class GatedSSMBlock(nn.Module):
@@ -487,18 +554,23 @@ class GatedSSMBlock(nn.Module):
         )
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
 
-    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
-        """Combine the conv'd streams into a (B, L, d_inner) pre-gate tensor."""
+    def mix(self, streams: list[torch.Tensor],
+            ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Combine the conv'd streams into a (B, L, d_inner) pre-gate tensor.
+
+        ``ids`` is the optional (B, L) raw input-symbol tensor; only symbol-
+        conditioned cores use it, all others ignore it.
+        """
         raise NotImplementedError
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ids: torch.Tensor | None = None) -> torch.Tensor:
         squeeze = x.dim() == 2
         if squeeze:
             x = x.unsqueeze(1)
         *raw, z = self.in_proj(x).chunk(self.n_streams + 1, dim=-1)
         streams = [F.silu(_causal_depthwise(s, conv, self.conv_k))
                    for s, conv in zip(raw, self.convs)]
-        out = self.out_proj(self.mix(streams) * F.silu(z))
+        out = self.out_proj(self.mix(streams, ids) * F.silu(z))
         return out.squeeze(1) if squeeze else out
 
 
@@ -511,7 +583,7 @@ class MambaBlock(GatedSSMBlock):
         super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
         self.ssm = SelectiveSSM(self.d_inner, d_state, dt_rank, chunk=chunk)
 
-    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
+    def mix(self, streams, ids=None) -> torch.Tensor:
         return self.ssm(streams[0])
 
 
@@ -556,7 +628,7 @@ class CoincidenceSSM(GatedSSMBlock):
         self.ssm_b = SelectiveSSM(self.d_inner, d_state, dt_rank, chunk=chunk)
         self.plateau = Plateau(self.d_inner) if use_plateau else None
 
-    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
+    def mix(self, streams, ids=None) -> torch.Tensor:
         ya, yb = self.ssm_a(streams[0]), self.ssm_b(streams[1])
         y = ya * yb if self.combine == "mult" else ya + yb
         return self.plateau(y) if self.plateau is not None else y
@@ -595,7 +667,7 @@ class DendriticSSMBlock(GatedSSMBlock):
             self.bind_in = nn.Linear(G, G, bias=True)
             self.bind_out = nn.Linear(G, self.d_inner, bias=True)
 
-    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
+    def mix(self, streams, ids=None) -> torch.Tensor:
         x_in = streams[0]
         B, L, _ = x_in.shape
         xb = x_in.view(B, L, self.G, self.db).permute(0, 2, 1, 3).reshape(B * self.G, L, self.db)
@@ -625,7 +697,7 @@ class RecurrentDendriticBlock(GatedSSMBlock):
         super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
         self.ssm = PlateauRecurrentSSM(self.d_inner, d_state, dt_rank)
 
-    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
+    def mix(self, streams, ids=None) -> torch.Tensor:
         return self.ssm(streams[0])
 
 
@@ -643,7 +715,7 @@ class RotationRecurrentBlock(GatedSSMBlock):
         super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
         self.ssm = RotationRecurrentSSM(self.d_inner, d_state, dt_rank)
 
-    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
+    def mix(self, streams, ids=None) -> torch.Tensor:
         return self.ssm(streams[0])
 
 
@@ -661,7 +733,7 @@ class QuantizedRotationBlock(GatedSSMBlock):
         super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
         self.ssm = QuantizedRotationSSM(self.d_inner, d_state, dt_rank, n_bins=n_bins)
 
-    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
+    def mix(self, streams, ids=None) -> torch.Tensor:
         return self.ssm(streams[0])
 
 
@@ -680,5 +752,26 @@ class OrthogonalRecurrentBlock(GatedSSMBlock):
         super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
         self.ssm = OrthogonalRecurrentSSM(self.d_inner, d_state, dt_rank, n_bins=n_bins)
 
-    def mix(self, streams: list[torch.Tensor]) -> torch.Tensor:
+    def mix(self, streams, ids=None) -> torch.Tensor:
         return self.ssm(streams[0])
+
+
+class SymbolicOrthogonalBlock(GatedSSMBlock):
+    """Gated block wrapping ``SymbolicOrthogonalSSM`` (per-symbol exact O(2)).
+
+    Same scaffold as the other blocks; the core's per-step O(2) transform is a
+    fixed function of the RAW input symbol (one shared scalar angle/sign per
+    symbol), threaded in as ``ids`` -- the clean test of exact symbol->transition
+    locking on non-abelian state. ``chunk`` is accepted for uniformity but
+    ignored (sequential scan).
+    """
+
+    def __init__(self, d_model: int, d_inner: int | None = None, d_state: int = 8,
+                 dt_rank: int | None = None, conv_k: int = 4, expand: int = 2,
+                 n_bins: int = 12, n_in: int = 2, chunk: int = 8):
+        super().__init__(d_model, d_inner or expand * d_model, n_streams=1, conv_k=conv_k)
+        self.ssm = SymbolicOrthogonalSSM(self.d_inner, d_state, dt_rank,
+                                         n_bins=n_bins, n_in=n_in)
+
+    def mix(self, streams, ids=None) -> torch.Tensor:
+        return self.ssm(streams[0], ids)

@@ -110,7 +110,7 @@ def configure(args):
         torch.backends.cudnn.benchmark = True
     return MixerCfg(d_model=args.d_model, n_heads=args.n_heads, d_state=args.d_state,
                     conv_k=args.conv_k, n_branches=args.n_branches, chunk=args.chunk,
-                    rot_bins=args.rot_bins)
+                    rot_bins=args.rot_bins, n_in=S3_SIZE)
 
 
 def train_one(name, cfg, args, target_params, seed):

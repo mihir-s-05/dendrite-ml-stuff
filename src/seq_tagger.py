@@ -14,6 +14,7 @@ loss, and reporting.
   dendritic_rot  selective complex ROTATION (SO(2)) in the loop (cyclic groups)
   dendritic_qrot rotation snapped to an exact angle grid (zero drift, mod-k)
   dendritic_orth O(2) rotation-OR-reflection in the loop (dihedral/non-abelian)
+  dendritic_orth_sym  O(2) transform fixed per RAW input symbol (group-rep prior)
 """
 
 from __future__ import annotations
@@ -29,7 +30,8 @@ from src.blocks import SwiGLU
 from src.counting import size_to_budget
 from src.ssm import (CoincidenceSSM, DendriticSSMBlock, MambaBlock,
                      OrthogonalRecurrentBlock, QuantizedRotationBlock,
-                     RecurrentDendriticBlock, RotationRecurrentBlock)
+                     RecurrentDendriticBlock, RotationRecurrentBlock,
+                     SymbolicOrthogonalBlock)
 
 
 class CausalAttention(nn.Module):
@@ -43,7 +45,7 @@ class CausalAttention(nn.Module):
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ids: torch.Tensor | None = None) -> torch.Tensor:
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
         shape = (B, T, self.h, C // self.h)
@@ -72,6 +74,7 @@ class MixerCfg:
     n_branches: int
     chunk: int
     rot_bins: int = 12
+    n_in: int = 2
 
 
 def _w(w: int) -> int:
@@ -102,6 +105,10 @@ MIXERS: dict[str, MixerSpec] = {
     "dendritic_orth": MixerSpec(
         lambda w, c: OrthogonalRecurrentBlock(c.d_model, d_inner=_w(w), d_state=c.d_state,
                                               conv_k=c.conv_k, n_bins=c.rot_bins), False),
+    "dendritic_orth_sym": MixerSpec(
+        lambda w, c: SymbolicOrthogonalBlock(c.d_model, d_inner=_w(w), d_state=c.d_state,
+                                             conv_k=c.conv_k, n_bins=c.rot_bins,
+                                             n_in=c.n_in), False),
 }
 MODELS = list(MIXERS)
 
@@ -126,8 +133,8 @@ class Block(nn.Module):
         self.n2 = nn.LayerNorm(d_model)
         self.ffn = SwiGLU(d_model, ffn_hidden)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.mix(self.n1(x))
+    def forward(self, x: torch.Tensor, ids: torch.Tensor | None = None) -> torch.Tensor:
+        x = x + self.mix(self.n1(x), ids)
         x = x + self.ffn(self.n2(x))
         return x
 
@@ -161,6 +168,6 @@ class SeqTagger(nn.Module):
                 raise ValueError(f"seq_len {T} exceeds max_len {self.pos.num_embeddings}")
             x = x + self.pos(torch.arange(T, device=bits.device))[None]
         for b in self.blocks:
-            x = b(x)
+            x = b(x, bits)                                # raw symbols for symbol-conditioned mixers
         out = self.head(self.norm(x))                     # (B, T, n_out)
         return out.squeeze(-1) if self.n_out == 1 else out

@@ -32,6 +32,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir))
 
 from src.counting import count_params
 from src.seq_tagger import MIXERS, MODELS, CausalAttention, MixerCfg, SeqTagger, sized_mixer
+from src.streaming_sweep import (add_sweep_args, run_sweep, sample_train_len,
+                                 train_lengths)
 from src.tasks import make_streaming_parity
 from src.train import pick_device, set_seed
 
@@ -82,6 +84,7 @@ def parse_args():
     ap.add_argument("--models", nargs="+", default=MODELS)
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--threads", type=int, default=0)
+    add_sweep_args(ap)
     for name, typ in [("d-model", int), ("n-layers", int), ("n-heads", int),
                       ("train-len", int), ("batch-size", int), ("steps", int),
                       ("lr", float), ("ffn-mult", int), ("d-state", int),
@@ -114,7 +117,8 @@ def configure(args):
 def train_one(name, cfg, args, target_params, seed):
     set_seed(seed)
     make_mixer, use_pos = sized_mixer(name, target_params, cfg)
-    max_len = max(args.eval_lens + [args.train_len])
+    train_lens = train_lengths(args)
+    max_len = max(args.eval_lens + train_lens)
     model = SeqTagger(args.d_model, args.n_layers, make_mixer,
                       args.ffn_mult * args.d_model, max_len, use_pos, n_out=1).to(args.device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -122,13 +126,14 @@ def train_one(name, cfg, args, target_params, seed):
     rng = np.random.default_rng(seed)
     model.train()
     for step in range(args.steps):
-        bits, par = batch(rng, args.batch_size, args.train_len, args.device)
+        L_t = sample_train_len(train_lens, rng)
+        bits, par = batch(rng, args.batch_size, L_t, args.device)
         loss = loss_fn(model(bits), par)
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
     accs = {L: evaluate(model, L, args.device) for L in args.eval_lens}
-    return accs, count_params(model.blocks[0].mix)
+    return accs, count_params(model.blocks[0].mix), model
 
 
 def main():
@@ -146,37 +151,9 @@ def main():
         make_mixer, _ = sized_mixer(m, target_params, cfg)
         print(f"  {m:14s} mixer_params={count_params(make_mixer())}")
 
-    seeds = list(range(args.seeds))
-    # acc[model][L] = list of (per_pos, final) over seeds
-    results: dict[str, dict[int, list]] = {m: {L: [] for L in args.eval_lens}
-                                           for m in args.models}
-    print("\n=== TRAINING (per-position acc / final-position acc, by eval length) ===")
-    for m in args.models:
-        for s in seeds:
-            accs, mp = train_one(m, cfg, args, target_params, s)
-            for L, (pp, fin) in accs.items():
-                results[m][L].append((pp, fin))
-            shown = "  ".join(f"L{L}:{accs[L][0]*100:4.0f}/{accs[L][1]*100:4.0f}"
-                              for L in args.eval_lens)
-            print(f"  [{m:14s} seed={s}] {shown}", flush=True)
-
-    print("\n=== STREAMING PARITY (per-position acc %, mean over seeds) ===")
-    print("  model           " + "".join(f"{'L='+str(L):>10s}" for L in args.eval_lens))
-    for m in args.models:
-        line = f"  {m:14s}  "
-        for L in args.eval_lens:
-            pp = np.mean([v[0] for v in results[m][L]]) * 100
-            line += f"{pp:>10.1f}"
-        print(line)
-    print("\n=== final-position acc % (the hard bit: parity of the whole stream) ===")
-    print("  model           " + "".join(f"{'L='+str(L):>10s}" for L in args.eval_lens))
-    for m in args.models:
-        line = f"  {m:14s}  "
-        for L in args.eval_lens:
-            fin = np.mean([v[1] for v in results[m][L]]) * 100
-            line += f"{fin:>10.1f}"
-        print(line)
-    print()
+    run_sweep(args, cfg, target_params, train_one, task_tag="parity",
+              stream_title="STREAMING PARITY", chance=50.0,
+              hard_desc="parity of the whole stream")
 
 
 if __name__ == "__main__":

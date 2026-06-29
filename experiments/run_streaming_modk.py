@@ -31,6 +31,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir))
 
 from src.counting import count_params
 from src.seq_tagger import MIXERS, MODELS, CausalAttention, MixerCfg, SeqTagger, sized_mixer
+from src.streaming_sweep import (add_sweep_args, run_sweep, sample_train_len,
+                                 train_lengths)
 from src.tasks import make_streaming_modk
 from src.train import pick_device, set_seed
 
@@ -87,6 +89,7 @@ def parse_args():
     ap.add_argument("--snap-warmup-frac", type=float, default=0.5,
                     help="dendritic_qrot: fraction of training over which the angle snap "
                          "is annealed soft->hard (0 = hard from step 0)")
+    add_sweep_args(ap)
     for name, typ in [("d-model", int), ("n-layers", int), ("n-heads", int),
                       ("train-len", int), ("batch-size", int), ("steps", int),
                       ("lr", float), ("ffn-mult", int), ("d-state", int),
@@ -124,7 +127,8 @@ def configure(args):
 def train_one(name, cfg, args, target_params, seed):
     set_seed(seed)
     make_mixer, use_pos = sized_mixer(name, target_params, cfg)
-    max_len = max(args.eval_lens + [args.train_len])
+    train_lens = train_lengths(args)
+    max_len = max(args.eval_lens + train_lens)
     model = SeqTagger(args.d_model, args.n_layers, make_mixer,
                       args.ffn_mult * args.d_model, max_len, use_pos,
                       n_out=args.mod).to(args.device)
@@ -141,7 +145,8 @@ def train_one(name, cfg, args, target_params, seed):
     model.train()
     for step in range(args.steps):
         set_snap(min(1.0, step / warmup))
-        bits, y = batch(rng, args.batch_size, args.train_len, args.mod, args.device)
+        L_t = sample_train_len(train_lens, rng)
+        bits, y = batch(rng, args.batch_size, L_t, args.mod, args.device)
         logits = model(bits)                              # (B, T, k)
         loss = loss_fn(logits.reshape(-1, args.mod), y.reshape(-1))
         opt.zero_grad(); loss.backward()
@@ -149,7 +154,7 @@ def train_one(name, cfg, args, target_params, seed):
         opt.step()
     set_snap(1.0)                                         # full exact snap for eval
     accs = {L: evaluate(model, L, args.mod, args.device) for L in args.eval_lens}
-    return accs, count_params(model.blocks[0].mix)
+    return accs, count_params(model.blocks[0].mix), model
 
 
 def main():
@@ -167,39 +172,9 @@ def main():
         make_mixer, _ = sized_mixer(m, target_params, cfg)
         print(f"  {m:14s} mixer_params={count_params(make_mixer())}")
 
-    seeds = list(range(args.seeds))
-    results: dict[str, dict[int, list]] = {m: {L: [] for L in args.eval_lens}
-                                           for m in args.models}
-    print(f"\n=== TRAINING (per-position acc / final-position acc, by eval length; "
-          f"mod {args.mod}) ===")
-    for m in args.models:
-        for s in seeds:
-            accs, mp = train_one(m, cfg, args, target_params, s)
-            for L, (pp, fin) in accs.items():
-                results[m][L].append((pp, fin))
-            shown = "  ".join(f"L{L}:{accs[L][0]*100:4.0f}/{accs[L][1]*100:4.0f}"
-                              for L in args.eval_lens)
-            print(f"  [{m:14s} seed={s}] {shown}", flush=True)
-
-    print(f"\n=== STREAMING MOD-{args.mod} (per-position acc %, mean over seeds; "
-          f"chance={100.0/args.mod:.1f}%) ===")
-    print("  model           " + "".join(f"{'L='+str(L):>10s}" for L in args.eval_lens))
-    for m in args.models:
-        line = f"  {m:14s}  "
-        for L in args.eval_lens:
-            pp = np.mean([v[0] for v in results[m][L]]) * 100
-            line += f"{pp:>10.1f}"
-        print(line)
-    print(f"\n=== final-position acc % (the hard bit: count mod {args.mod} of the "
-          f"whole stream) ===")
-    print("  model           " + "".join(f"{'L='+str(L):>10s}" for L in args.eval_lens))
-    for m in args.models:
-        line = f"  {m:14s}  "
-        for L in args.eval_lens:
-            fin = np.mean([v[1] for v in results[m][L]]) * 100
-            line += f"{fin:>10.1f}"
-        print(line)
-    print()
+    run_sweep(args, cfg, target_params, train_one, task_tag=f"mod {args.mod}",
+              stream_title=f"STREAMING MOD-{args.mod}", chance=100.0 / args.mod,
+              hard_desc=f"count mod {args.mod} of the whole stream")
 
 
 if __name__ == "__main__":

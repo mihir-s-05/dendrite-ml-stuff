@@ -34,6 +34,9 @@ class ResultStore:
     def has(self, section: str, d: int, model: str, seed: int) -> bool:
         return self._key(section, d, model, seed) in self._acc
 
+    def get(self, section: str, d: int, model: str, seed: int) -> float | None:
+        return self._acc.get(self._key(section, d, model, seed))
+
     def record(self, section: str, d: int, model: str, seed: int,
                acc: float, params: int, secs: float) -> None:
         self._acc[self._key(section, d, model, seed)] = acc
